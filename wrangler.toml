@@ -17,7 +17,7 @@ binding = "NOTES_KV"
 id = "88a93c8ef6144036813a37f098980ff9"
 preview_id = ""
 
-[[r2_buckets]]
-binding = "NOTES_R2_BUCKET"
-bucket_name = ""
-preview_bucket_name = "notes-files-preview"
+#[[r2_buckets]]
+#binding = "NOTES_R2_BUCKET"
+#bucket_name = ""
+#preview_bucket_name = "notes-files-preview"
