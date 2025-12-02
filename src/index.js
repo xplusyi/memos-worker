@@ -545,7 +545,12 @@ async function handleNotesList(request, env, session) {
 				}
 
 				// 核心可见性过滤逻辑
-				whereClauses.push("(n.visibility = 'workspace' OR n.owner_id = ?)");
+				// 如果是主管理员，则不应用可见性过滤
+				const isAdmin = session.username === env.USERNAME;
+				if (!isAdmin) {
+					whereClauses.push("(n.visibility = 'workspace' OR n.owner_id = ?)");
+				}
+
 
 				if (startTimestamp && endTimestamp) {
 					// 将字符串时间戳转换为数字
@@ -634,7 +639,7 @@ async function handleNotesList(request, env, session) {
 
 						if (storageType === 'kv') {
 							const arrayBuffer = await file.arrayBuffer();
-							await env.NOTES_KV.put(`file:${noteId}/${fileId}`, arrayBuffer);
+							await env.NOTES_KV.put(`file:${noteId}/${fileId}`, arrayBuffer, { metadata: { name: file.name, type: file.type } });
 						} else {
 							await env.NOTES_R2_BUCKET.put(`${noteId}/${fileId}`, file.stream());
 						}
@@ -757,7 +762,7 @@ async function handleNoteDetail(request, noteId, env, session) {
 
 							if (storageType === 'kv') {
 								const arrayBuffer = await file.arrayBuffer();
-								await env.NOTES_KV.put(`file:${id}/${fileId}`, arrayBuffer);
+								await env.NOTES_KV.put(`file:${id}/${fileId}`, arrayBuffer, { metadata: { name: file.name, type: file.type } });
 							} else {
 								await env.NOTES_R2_BUCKET.put(`${id}/${fileId}`, file.stream());
 							}
