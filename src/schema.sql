@@ -12,6 +12,8 @@ CREATE TABLE notes (
   is_pinned BOOLEAN DEFAULT 0,
   is_favorited INTEGER DEFAULT 0 NOT NULL,
   is_archived INTEGER DEFAULT 0 NOT NULL,
+  owner_id TEXT,
+  visibility TEXT DEFAULT 'private',
   pics TEXT,
   videos TEXT
 );

@@ -70,7 +70,7 @@ async function handleApiRequest(request, env) {
 	}
 
 	if (request.method === 'POST' && pathname === '/api/notes/merge') {
-		return handleMergeNotes(request, env);
+		return handleMergeNotes(request, env, session);
 	}
 
 	const shareNoteMatch = pathname.match(/^\/api\/notes\/(\d+)\/share$/);
@@ -168,11 +168,11 @@ async function handleApiRequest(request, env) {
 	const noteDetailMatch = pathname.match(/^\/api\/notes\/([^\/]+)$/);
 	if (noteDetailMatch) {
 		const noteId = noteDetailMatch[1];
-		return handleNoteDetail(request, noteId, env);
+		return handleNoteDetail(request, noteId, env, session);
 	}
 
 	if (pathname === '/api/notes') {
-		return handleNotesList(request, env);
+		return handleNotesList(request, env, session);
 	}
 	return new Response('Not Found', { status: 404 });
 }
@@ -387,21 +387,48 @@ async function isSessionAuthenticated(request, env) {
 async function handleLogin(request, env) {
 	try {
 		const { username, password } = await request.json();
+
+		// 1. 检查是否为主管理员
 		if (username === env.USERNAME && password === env.PASSWORD) {
-			const sessionId = crypto.randomUUID();
-			const sessionData = { username, loggedInAt: Date.now() };
-			await env.NOTES_KV.put(`session:${sessionId}`, JSON.stringify(sessionData), {
-				expirationTtl: SESSION_DURATION_SECONDS,
-			});
-			const headers = new Headers();
-			headers.append('Set-Cookie', `${SESSION_COOKIE}=${sessionId}; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_DURATION_SECONDS}`);
-			return jsonResponse({ success: true }, 200, headers);
+			return createSession(username, env);
+		}
+
+		// 2. 如果不是主管理员，检查是否为多用户
+		const usersJson = await env.NOTES_KV.get('users');
+		if (usersJson) {
+			try {
+				const users = JSON.parse(usersJson);
+				if (Array.isArray(users)) {
+					const user = users.find(u => u.username === username && u.password === password);
+					if (user) {
+						return createSession(username, env);
+					}
+				}
+			} catch (e) {
+				console.error("Error parsing multi-user config from KV:", e.message);
+				// 如果配置错误，则不执行任何操作，以防出现安全问题
+			}
 		}
 	} catch (e) {
 		console.error("Login Error:", e.message);
 	}
 	return jsonResponse({ error: 'Invalid credentials' }, 401);
 }
+
+/**
+ * 为成功登录的用户创建会话
+ */
+async function createSession(username, env) {
+	const sessionId = crypto.randomUUID();
+	const sessionData = { username, loggedInAt: Date.now() };
+	await env.NOTES_KV.put(`session:${sessionId}`, JSON.stringify(sessionData), {
+		expirationTtl: SESSION_DURATION_SECONDS,
+	});
+	const headers = new Headers();
+	headers.append('Set-Cookie', `${SESSION_COOKIE}=${sessionId}; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_DURATION_SECONDS}`);
+	return jsonResponse({ success: true }, 200, headers);
+}
+
 
 /**
  * 处理退出登录请求
@@ -434,6 +461,7 @@ async function handleGetSettings(request, env) {
 		showHeatmap: true, // 默认显示热力图
 		imageUploadDestination: 'local', // 默认使用R2
 		imgurClientId: '',
+		attachmentStorage: 'r2', // 'r2' 或 'kv'
 		surfaceColor: '#ffffff',
 		surfaceColorDark: '#151f31',
 		surfaceOpacity: 1,
@@ -453,11 +481,17 @@ async function handleGetSettings(request, env) {
 
 	let savedSettings = await env.NOTES_KV.get('user_settings', 'json');
 
-	// 如果 KV 中没有设置，则返回默认值
+	// 合并保存的设置和默认设置，以确保所有字段都存在
 	if (!savedSettings) {
-		return jsonResponse(defaultSettings);
+		savedSettings = {};
 	}
-	return jsonResponse(savedSettings);
+	const mergedSettings = { ...defaultSettings, ...savedSettings };
+
+	return jsonResponse(mergedSettings);
+}
+
+async function getSettings(env) {
+	return await env.NOTES_KV.get('user_settings', 'json') || {};
 }
 
 /**
@@ -477,7 +511,7 @@ async function handleSetSettings(request, env) {
 /**
  * 处理笔记列表的 GET 和 POST
  */
-async function handleNotesList(request, env) {
+async function handleNotesList(request, env, session) {
 	const db = env.DB;
 
 	try {
@@ -495,7 +529,7 @@ async function handleNotesList(request, env) {
 				const isArchivedMode = url.searchParams.get('archived') === 'true';
 
 				let whereClauses = [];
-				let bindings = [];
+				let bindings = [session.username];
 				let joinClause = "";
 
 				if (isArchivedMode) {
@@ -504,6 +538,9 @@ async function handleNotesList(request, env) {
 					// 默认（包括收藏夹）都应该排除已归档的
 					whereClauses.push("n.is_archived = 0");
 				}
+
+				// 核心可见性过滤逻辑
+				whereClauses.push("(n.visibility = 'workspace' OR n.owner_id = ?)");
 
 				if (startTimestamp && endTimestamp) {
 					// 将字符串时间戳转换为数字
@@ -571,11 +608,12 @@ async function handleNotesList(request, env) {
 
 				// 【核心修改】在 INSERT 语句中加入新的 pics 字段
 				const insertStmt = db.prepare(
-					"INSERT INTO notes (content, files, is_pinned, created_at, updated_at, pics) VALUES (?, ?, 0, ?, ?, ?) RETURNING id"
+					"INSERT INTO notes (content, files, is_pinned, created_at, updated_at, pics, owner_id, visibility) VALUES (?, ?, 0, ?, ?, ?, ?, 'private') RETURNING id"
 				);
 				// 先用一个空的 files 数组插入
 				// 【核心修改】将提取出的 picUrls 绑定到 SQL 语句中
-				const { id: noteId } = await insertStmt.bind(content, "[]", now, now, picUrls).first();
+				const { id: noteId } = await insertStmt.bind(content, "[]", now, now, picUrls, session.username).first();
+
 				if (!noteId) {
 					throw new Error("Failed to create note and get ID.");
 				}
@@ -583,12 +621,21 @@ async function handleNotesList(request, env) {
 				// --- 【重要逻辑调整】现在上传的文件，只有非图片类型才算作 "附件" (files) ---
 				for (const file of files) {
 					// 只有当文件存在，并且 MIME 类型不是图片时，才将其添加到 filesMeta
-					if (file.name && file.size > 0 && !file.type.startsWith('image/')) {
+					if (file.name && file.size > 0 && !file.type.startsWith('image/')) {						
 						const fileId = crypto.randomUUID();
-						await env.NOTES_R2_BUCKET.put(`${noteId}/${fileId}`, file.stream());
-						filesMeta.push({ id: fileId, name: file.name, size: file.size, type: file.type });
+						const userSettings = await getSettings(env);
+						const storageType = userSettings.attachmentStorage === 'kv' ? 'kv' : 'r2';
+
+						if (storageType === 'kv') {
+							const arrayBuffer = await file.arrayBuffer();
+							await env.NOTES_KV.put(`file:${noteId}/${fileId}`, arrayBuffer);
+						} else {
+							await env.NOTES_R2_BUCKET.put(`${noteId}/${fileId}`, file.stream());
+						}
+						filesMeta.push({ id: fileId, name: file.name, size: file.size, type: file.type, storage: storageType });
 					}
 				}
+
 
 				// 如果有非图片附件，再更新数据库中的 files 字段
 				if (filesMeta.length > 0) {
@@ -615,7 +662,7 @@ async function handleNotesList(request, env) {
 /**
  * 处理单条笔记的 PUT 和 DELETE
  */
-async function handleNoteDetail(request, noteId, env) {
+async function handleNoteDetail(request, noteId, env, session) {
 	const db = env.DB;
 	const id = parseInt(noteId);
 	if (isNaN(id)) {
@@ -624,7 +671,12 @@ async function handleNoteDetail(request, noteId, env) {
 
 	try {
 		// 首先获取现有笔记，用于文件删除和返回数据
-		let existingNote = await db.prepare("SELECT * FROM notes WHERE id = ?").bind(id).first();
+		let existingNote = await db.prepare("SELECT * FROM notes WHERE id = ? AND (visibility = 'workspace' OR owner_id = ?)").bind(id, session.username).first();
+
+		if (existingNote && existingNote.owner_id !== session.username) {
+			return jsonResponse({ error: 'Forbidden: You can only modify your own notes.' }, 403);
+		}
+
 		if (!existingNote) {
 			return new Response('Not Found', { status: 404 });
 		}
@@ -650,9 +702,20 @@ async function handleNoteDetail(request, noteId, env) {
 					// 处理附件删除 (逻辑不变，因为它操作的是 files 字段)
 					const filesToDelete = JSON.parse(formData.get('filesToDelete') || '[]');
 					if (filesToDelete.length > 0) {
-						const r2KeysToDelete = filesToDelete.map(fileId => `${id}/${fileId}`);
-						await env.NOTES_R2_BUCKET.delete(r2KeysToDelete);
-						currentFiles = currentFiles.filter(file => !filesToDelete.includes(file.id));
+						const filesToDeleteMetas = currentFiles.filter(f => filesToDelete.includes(f.id));
+						const r2KeysToDelete = filesToDeleteMetas.filter(f => f.storage !== 'kv').map(f => `${id}/${f.id}`);
+						const kvKeysToDelete = filesToDeleteMetas.filter(f => f.storage === 'kv').map(f => `file:${id}/${f.id}`);
+
+						if (r2KeysToDelete.length > 0) {
+							await env.NOTES_R2_BUCKET.delete(r2KeysToDelete);
+						}
+						if (kvKeysToDelete.length > 0) {
+							// KV does not support batch delete, so we do it one by one.
+							for (const key of kvKeysToDelete) {
+								await env.NOTES_KV.delete(key);
+							}
+						}
+						currentFiles = currentFiles.filter(f => !filesToDelete.includes(f.id));
 					}
 
 					// 在处理完文件删除后，检查笔记是否应该被删除
@@ -661,9 +724,17 @@ async function handleNoteDetail(request, noteId, env) {
 						// 笔记即将变空，执行删除操作
 						// 1. 删除 R2 中的所有剩余文件（如果有的话，虽然逻辑上这里 currentFiles 应该是空的）
 						const allR2Keys = existingNote.files.map(file => `${id}/${file.id}`);
+						const allR2KeysToDelete = existingNote.files.filter(f => f.storage !== 'kv').map(f => `${id}/${f.id}`);
+						const allKvKeysToDelete = existingNote.files.filter(f => f.storage === 'kv').map(f => `file:${id}/${f.id}`);
 						if (allR2Keys.length > 0) {
-							await env.NOTES_R2_BUCKET.delete(allR2Keys);
+							await env.NOTES_R2_BUCKET.delete(allR2KeysToDelete);
 						}
+						if (allKvKeysToDelete.length > 0) {
+							for (const key of allKvKeysToDelete) {
+								await env.NOTES_KV.delete(key);
+							}
+						}
+
 						// 2. 从数据库删除笔记
 						await db.prepare("DELETE FROM notes WHERE id = ?").bind(id).run();
 						// 3. 返回特殊标记，告知前端整个笔记已被删除
@@ -674,9 +745,17 @@ async function handleNoteDetail(request, noteId, env) {
 					for (const file of newFiles) {
 						// 只有当文件存在，并且不是图片时，才作为附件处理
 						if (file.name && file.size > 0 && !file.type.startsWith('image/')) {
+							const userSettings = await getSettings(env);
+							const storageType = userSettings.attachmentStorage === 'kv' ? 'kv' : 'r2';
 							const fileId = crypto.randomUUID();
-							await env.NOTES_R2_BUCKET.put(`${id}/${fileId}`, file.stream());
-							currentFiles.push({ id: fileId, name: file.name, size: file.size, type: file.type });
+
+							if (storageType === 'kv') {
+								const arrayBuffer = await file.arrayBuffer();
+								await env.NOTES_KV.put(`file:${id}/${fileId}`, arrayBuffer);
+							} else {
+								await env.NOTES_R2_BUCKET.put(`${id}/${fileId}`, file.stream());
+							}
+							currentFiles.push({ id: fileId, name: file.name, size: file.size, type: file.type, storage: storageType });
 						}
 					}
 
@@ -706,6 +785,11 @@ async function handleNoteDetail(request, noteId, env) {
 					const stmt = db.prepare("UPDATE notes SET is_archived = ? WHERE id = ?");
 					await stmt.bind(isArchived, id).run();
 				}
+				if (formData.has('visibility')) {
+					const visibility = formData.get('visibility') === 'workspace' ? 'workspace' : 'private';
+					const stmt = db.prepare("UPDATE notes SET visibility = ? WHERE id = ?");
+					await stmt.bind(visibility, id).run();
+				}
 
 				const updatedNote = await db.prepare("SELECT * FROM notes WHERE id = ?").bind(id).first();
 				if (typeof updatedNote.files === 'string') {
@@ -715,14 +799,23 @@ async function handleNoteDetail(request, noteId, env) {
 			}
 
 			case 'DELETE': {
-				let allR2KeysToDelete = [];
+				let r2KeysToDelete = [];
+				let kvKeysToDelete = [];
 
 				if (existingNote.files && existingNote.files.length > 0) {
-					const attachmentKeys = existingNote.files
-						.filter(file => file.id)
+					const r2AttachmentKeys = existingNote.files
+						.filter(file => file.id && file.storage !== 'kv')
 						.map(file => `${id}/${file.id}`);
-					allR2KeysToDelete.push(...attachmentKeys);
+					r2KeysToDelete.push(...r2AttachmentKeys);
+
+					const kvAttachmentKeys = existingNote.files
+						.filter(file => file.id)
+						.filter(file => file.storage === 'kv')
+						.map(file => `file:${id}/${file.id}`);
+					kvKeysToDelete.push(...kvAttachmentKeys);
 				}
+
+
 				let picUrls = [];
 				if (typeof existingNote.pics === 'string') {
 					try { picUrls = JSON.parse(existingNote.pics); } catch (e) { }
@@ -741,11 +834,16 @@ async function handleNoteDetail(request, noteId, env) {
 						return null;
 					}).filter(key => key !== null);
 
-					allR2KeysToDelete.push(...imageKeys);
+					r2KeysToDelete.push(...imageKeys);
 				}
 
-				if (allR2KeysToDelete.length > 0) {
-					await env.NOTES_R2_BUCKET.delete(allR2KeysToDelete);
+				if (r2KeysToDelete.length > 0) {
+					await env.NOTES_R2_BUCKET.delete(r2KeysToDelete);
+				}
+				if (kvKeysToDelete.length > 0) {
+					for (const key of kvKeysToDelete) {
+						await env.NOTES_KV.delete(key);
+					}
 				}
 
 				await db.prepare("DELETE FROM notes WHERE id = ?").bind(id).run();
@@ -783,20 +881,32 @@ async function handleFileRequest(noteId, fileId, request, env) {
 
 	const fileMeta = files.find(f => f.id === fileId);
 
-	// 尝试从 R2 获取文件对象
-	const object = await env.NOTES_R2_BUCKET.get(`${id}/${fileId}`);
-	if (object === null) {
-		// 如果 R2 中确实没有这个文件，才返回 404
-		return new Response('File not found in storage', { status: 404 });
+	const headers = new Headers();
+	headers.set('Cache-Control', 'public, max-age=86400, immutable');
+	let fileBody;
+
+	// 根据元数据决定从哪里获取文件
+	if (fileMeta && fileMeta.storage === 'kv') {
+		const fileData = await env.NOTES_KV.get(`file:${id}/${fileId}`, 'arrayBuffer');
+		if (!fileData) {
+			return new Response('File not found in KV storage', { status: 404 });
+		}
+		fileBody = fileData;
+	} else {
+		// 默认或明确指定为 R2
+		const object = await env.NOTES_R2_BUCKET.get(`${id}/${fileId}`);
+		if (object === null) {
+			return new Response('File not found in R2 storage', { status: 404 });
+		}
+		object.writeHttpMetadata(headers);
+		headers.set('etag', object.httpEtag);
+		fileBody = object.body;
 	}
 
-	const headers = new Headers();
-	object.writeHttpMetadata(headers); // 从 R2 对象中写入元数据（如 Content-Type）
-	headers.set('etag', object.httpEtag);
-	headers.set('Cache-Control', 'public, max-age=86400, immutable');
 
 	// --- 根据是否存在 fileMeta 来决定如何设置 headers ---
 	if (fileMeta) {
+		headers.set('Content-Length', fileMeta.size);
 		// 【情况一：元数据存在】这是标准文件或旧的图片，按原逻辑处理
 		const contentType = fileMeta.type || 'application/octet-stream';
 		const fileExtension = fileMeta.name.split('.').pop().toLowerCase();
@@ -819,7 +929,7 @@ async function handleFileRequest(noteId, fileId, request, env) {
 		headers.set('Content-Disposition', 'inline');
 	}
 
-	return new Response(object.body, { headers });
+	return new Response(fileBody, { headers });
 }
 /**
  *  将 Telegram 的格式化实体 (entities) 转换为 Markdown 文本
@@ -1046,7 +1156,7 @@ async function handleTelegramWebhook(request, env, secret) {
 		let mediaEmbeds = [];
 
 		const insertStmt = db.prepare("INSERT INTO notes (content, files, is_pinned, created_at, updated_at, pics, videos) VALUES (?, ?, 0, ?, ?, ?, ?) RETURNING id");
-		const { id: noteId } = await insertStmt.bind('', '[]', now, now, '[]', '[]').first();
+		const { id: noteId } = await insertStmt.bind('', '[]', now, now, '[]', '[]', session.username).first();
 		if (!noteId) {
 			throw new Error("无法在数据库中创建笔记记录。");
 		}
@@ -1946,7 +2056,7 @@ async function handlePublicRawNoteRequest(publicId, env) {
  * POST /api/notes/merge
  * Body: { sourceNoteId: number, targetNoteId: number, addSeparator: boolean }
  */
-async function handleMergeNotes(request, env) {
+async function handleMergeNotes(request, env, session) {
 	const db = env.DB;
 	try {
 		const { sourceNoteId, targetNoteId, addSeparator } = await request.json();
@@ -1954,14 +2064,18 @@ async function handleMergeNotes(request, env) {
 		if (!sourceNoteId || !targetNoteId || sourceNoteId === targetNoteId) {
 			return jsonResponse({ error: 'Invalid source or target note ID.' }, 400);
 		}
-
-		const [sourceNote, targetNote] = await Promise.all([
+		const username = session.username;
+		const [sourceNote, targetNote] = await Promise.all([ // 验证用户权限
 			db.prepare("SELECT * FROM notes WHERE id = ?").bind(sourceNoteId).first(),
 			db.prepare("SELECT * FROM notes WHERE id = ?").bind(targetNoteId).first(),
 		]);
 
 		if (!sourceNote || !targetNote) {
 			return jsonResponse({ error: 'One or both notes not found.' }, 404);
+		}
+		// 验证用户权限
+		if (sourceNote.owner_id !== username || targetNote.owner_id !== username) {
+			return jsonResponse({ error: 'Forbidden: You can only merge your own notes.' }, 403);
 		}
 
 		// 目标笔记在前，源笔记在后
@@ -1993,10 +2107,19 @@ async function handleMergeNotes(request, env) {
 			for (const file of sourceFiles) {
 				const oldKey = `${sourceNote.id}/${file.id}`;
 				const newKey = `${targetNote.id}/${file.id}`;
-				const object = await r2.get(oldKey);
-				if (object) {
-					await r2.put(newKey, object.body);
-					await r2.delete(oldKey);
+
+				if (file.storage === 'kv') {
+					const data = await env.NOTES_KV.get(`file:${oldKey}`, 'arrayBuffer');
+					if (data) {
+						await env.NOTES_KV.put(`file:${newKey}`, data);
+						await env.NOTES_KV.delete(`file:${oldKey}`);
+					}
+				} else { // R2 is the default
+					const object = await r2.get(oldKey);
+					if (object) {
+						await r2.put(newKey, object.body);
+						await r2.delete(oldKey);
+					}
 				}
 			}
 		}
