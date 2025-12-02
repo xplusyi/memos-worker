@@ -390,27 +390,24 @@ async function isSessionAuthenticated(request, env) {
  */
 async function handleLogin(request, env) {
 	try {
-		const { username, password } = await request.json();
+		const { username: loginUsername, password: loginPassword } = await request.json();
 
-		// 1. 检查是否为主管理员
-		if (username === env.USERNAME && password === env.PASSWORD) {
-			return createSession(username, env);
-		}
-
-		// 2. 如果不是主管理员，检查是否为多用户
+		// 统一从 KV 获取用户列表
 		const usersJson = await env.NOTES_KV.get('users');
 		if (usersJson) {
-			try {
-				const users = JSON.parse(usersJson);
-				if (Array.isArray(users)) {
-					const user = users.find(u => u.username === username && u.password === password);
-					if (user) {
-						return createSession(username, env);
-					}
+			const users = JSON.parse(usersJson);
+			// 【关键修复】确保 users 是一个数组再进行操作
+			if (Array.isArray(users)) {
+				// 查找匹配的用户
+				const user = users.find(u => u.username === loginUsername && u.password === loginPassword);
+				if (user) {
+					// 检查此用户是否为管理员 (列表中的第一个)
+					const isAdmin = users.length > 0 && users[0].username === user.username;
+					return createSession(user.username, isAdmin, env);
 				}
-			} catch (e) {
-				console.error("Error parsing multi-user config from KV:", e.message);
-				// 如果配置错误，则不执行任何操作，以防出现安全问题
+			} else {
+				// 如果 KV 中的 'users' 不是数组，记录一个错误
+				console.error("Configuration Error: The 'users' key in KV is not a valid JSON array.");
 			}
 		}
 	} catch (e) {
@@ -422,9 +419,9 @@ async function handleLogin(request, env) {
 /**
  * 为成功登录的用户创建会话
  */
-async function createSession(username, env) {
+async function createSession(username, isAdmin, env) {
 	const sessionId = crypto.randomUUID();
-	const sessionData = { username, loggedInAt: Date.now() };
+	const sessionData = { username, isAdmin, loggedInAt: Date.now() };
 	await env.NOTES_KV.put(`session:${sessionId}`, JSON.stringify(sessionData), {
 		expirationTtl: SESSION_DURATION_SECONDS,
 	});
@@ -546,7 +543,7 @@ async function handleNotesList(request, env, session) {
 
 				// 核心可见性过滤逻辑
 				// 如果是主管理员，则不应用可见性过滤
-				const isAdmin = session.username === env.USERNAME;
+				const isAdmin = session.isAdmin === true;
 				if (!isAdmin) {
 					whereClauses.push("(n.visibility = 'workspace' OR n.owner_id = ?)");
 				}
