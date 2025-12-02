@@ -69,6 +69,10 @@ async function handleApiRequest(request, env) {
 		return jsonResponse({ error: 'Unauthorized' }, 401);
 	}
 
+	if (pathname === '/api/session' && request.method === 'GET') {
+		return jsonResponse(session);
+	}
+
 	if (request.method === 'POST' && pathname === '/api/notes/merge') {
 		return handleMergeNotes(request, env, session);
 	}
@@ -461,6 +465,7 @@ async function handleGetSettings(request, env) {
 		showHeatmap: true, // 默认显示热力图
 		imageUploadDestination: 'local', // 默认使用R2
 		imgurClientId: '',
+		imageUploadStorage: 'r2', // 'r2', 'kv', 'imgur'
 		attachmentStorage: 'r2', // 'r2' 或 'kv'
 		surfaceColor: '#ffffff',
 		surfaceColorDark: '#151f31',
@@ -594,6 +599,7 @@ async function handleNotesList(request, env, session) {
 			case 'POST': {
 				const formData = await request.formData();
 				const content = formData.get('content')?.toString() || '';
+				const visibility = formData.get('visibility') || 'private';
 				const files = formData.getAll('file');
 
 				if (!content.trim() && files.every(f => !f.name)) {
@@ -608,11 +614,11 @@ async function handleNotesList(request, env, session) {
 
 				// 【核心修改】在 INSERT 语句中加入新的 pics 字段
 				const insertStmt = db.prepare(
-					"INSERT INTO notes (content, files, is_pinned, created_at, updated_at, pics, owner_id, visibility) VALUES (?, ?, 0, ?, ?, ?, ?, 'private') RETURNING id"
+					"INSERT INTO notes (content, files, is_pinned, created_at, updated_at, pics, owner_id, visibility) VALUES (?, ?, 0, ?, ?, ?, ?, ?) RETURNING id"
 				);
 				// 先用一个空的 files 数组插入
 				// 【核心修改】将提取出的 picUrls 绑定到 SQL 语句中
-				const { id: noteId } = await insertStmt.bind(content, "[]", now, now, picUrls, session.username).first();
+				const { id: noteId } = await insertStmt.bind(content, "[]", now, now, picUrls, session.username, visibility).first();
 
 				if (!noteId) {
 					throw new Error("Failed to create note and get ID.");
@@ -1372,14 +1378,28 @@ async function handleStandaloneImageUpload(request, env) {
 			return jsonResponse({ error: 'A file is required for upload.' }, 400);
 		}
 
+		const userSettings = await getSettings(env);
+		const storageType = userSettings.imageUploadStorage || 'r2';
 		const imageId = crypto.randomUUID();
-		// 我们将独立上传的图片统一放到一个 'uploads/' 目录下，与笔记附件分开
-		const r2Key = `uploads/${imageId}`;
 
-		// 将文件流上传到 R2
-		await env.NOTES_R2_BUCKET.put(r2Key, file.stream(), {
-			httpMetadata: { contentType: file.type },
-		});
+		if (storageType === 'kv') {
+			const arrayBuffer = await file.arrayBuffer();
+			await env.NOTES_KV.put(`uploads_kv:${imageId}`, arrayBuffer, {
+				metadata: { contentType: file.type },
+			});
+		} else { // 默认 'r2'
+			const r2Key = `uploads/${imageId}`;
+			await env.NOTES_R2_BUCKET.put(r2Key, file.stream(), {
+				httpMetadata: { contentType: file.type },
+			});
+		}
+
+		// 在 KV 中存储图片的元数据，指明其存储位置
+		await env.NOTES_KV.put(`image_meta:${imageId}`, JSON.stringify({
+			storage: storageType,
+			contentType: file.type,
+			fileName: file.name
+		}));
 
 		// 返回一个可用于访问此图片的内部 URL
 		// 这个 URL 对应我们下面创建的 handleServeStandaloneImage 函数的路由
@@ -1501,20 +1521,34 @@ async function handleGetAllAttachments(request, env) {
  * @returns {Promise<Response>}
  */
 async function handleServeStandaloneImage(imageId, env) {
-	const r2Key = `uploads/${imageId}`;
-	const object = await env.NOTES_R2_BUCKET.get(r2Key);
-
-	if (object === null) {
-		return new Response('File not found', { status: 404 });
+	const meta = await env.NOTES_KV.get(`image_meta:${imageId}`, 'json');
+	if (!meta) {
+		return new Response('Image metadata not found', { status: 404 });
 	}
 
 	const headers = new Headers();
-	object.writeHttpMetadata(headers);
-	headers.set('etag', object.httpEtag);
-	// 设置长时间的浏览器缓存，因为这些图片内容是不可变的
-	headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+	let body;
 
-	return new Response(object.body, { headers });
+	if (meta.storage === 'kv') {
+		const { value, metadata } = await env.NOTES_KV.getWithMetadata(`uploads_kv:${imageId}`, 'arrayBuffer');
+		if (!value) {
+			return new Response('Image not found in KV storage', { status: 404 });
+		}
+		body = value;
+		headers.set('Content-Type', metadata?.contentType || meta.contentType || 'image/png');
+	} else { // 'r2' is the default
+		const r2Key = `uploads/${imageId}`;
+		const object = await env.NOTES_R2_BUCKET.get(r2Key);
+		if (object === null) {
+			return new Response('Image not found in R2 storage', { status: 404 });
+		}
+		body = object.body;
+		object.writeHttpMetadata(headers);
+		headers.set('etag', object.httpEtag);
+	}
+
+	headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+	return new Response(body, { headers });
 }
 
 

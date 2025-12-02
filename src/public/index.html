@@ -1494,6 +1494,28 @@
 	min-height: 36px;
   }
 
+  .visibility-toggle-container {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background-color: var(--bg-color);
+    padding: 4px;
+    border-radius: 6px;
+  }
+  .visibility-toggle-btn {
+    padding: 4px 12px;
+    border: none;
+    background-color: transparent;
+    color: var(--text-secondary);
+    font-weight: 500;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .visibility-toggle-btn.active {
+    background-color: var(--surface-color);
+    color: var(--primary-color);
+  }
+
   #clear-tags-filter-btn {
 	opacity: 0;
 	visibility: hidden;
@@ -2087,6 +2109,26 @@
 	transform: translateY(0) scale(1);
   }
 
+  .user-info-container {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-left: 1rem;
+  }
+  .user-info-container .username {
+    font-weight: 600;
+    font-size: 0.9rem;
+  }
+  .user-info-container .logout-btn-header {
+    font-size: 0.8rem;
+    padding: 2px 8px;
+    background-color: var(--border-color);
+    color: var(--text-secondary);
+  }
+  .user-info-container .logout-btn-header:hover {
+    background-color: var(--danger-color);
+    color: white;
+  }
   .note-visibility-indicator {
     display: inline-flex;
     align-items: center;
@@ -3161,6 +3203,7 @@
 			<div id='app-container'>
 				<header class='app-header'>
 					<h3 id='header-title'>MEMOS</h3>
+					<div id="user-info-container" class="user-info-container" style="display: none;"></div>
 					<div class='header-actions'>
 						<button type='button' id='refresh-btn' class='icon-btn' title='Refresh'>
 							<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'>
@@ -3272,6 +3315,10 @@
 									<path d='M3 15h8v-2H3v2zm0 4h8v-2H3v2zm0-8h8V9H3v2zm0-6v2h8V5H3zm10 0h8v14h-8V5z' />
 								</svg>
 							</button>
+							<div class="visibility-toggle-container">
+								<button type="button" class="visibility-toggle-btn active" data-visibility="private">Private</button>
+								<button type="button" class="visibility-toggle-btn" data-visibility="workspace">Workspace</button>
+							</div>
 							<button type='submit' id='submit-btn' style='margin-left: 8px'>Save</button>
 						</div>
 					</div>
@@ -3648,11 +3695,18 @@
 				<h4>Image Paste Upload</h4>
 				<div id='image-upload-options'>
 					<div class='setting-item'>
+						<label for='upload-dest-kv'>
+							<input type='radio' id='upload-dest-kv' name='upload-destination' value='kv'>
+							KV Space
+						</label>
+					</div>
+					<div class='setting-item'>
 						<label for='upload-dest-local'>
 							<input type='radio' id='upload-dest-local' name='upload-destination' value='local' checked>
 							Local (via Worker & R2)
 						</label>
 					</div>
+
 					<div class='setting-item'>
 						<label for='upload-dest-imgur'>
 							<input type='radio' id='upload-dest-imgur' name='upload-destination' value='imgur'>
@@ -3664,6 +3718,14 @@
 					<label for='imgur-client-id'>Imgur Client ID</label>
 					<input type='text' id='imgur-client-id' placeholder='Enter your Imgur Client ID...'>
 				</div>
+			</div>
+			<div class='setting-group'>
+				<h4>Attachment Storage</h4>
+				<div class='setting-item'>
+					<label for='toggle-attachment-storage'>Store in KV (instead of R2)</label>
+					<input type='checkbox' id='toggle-attachment-storage' class='toggle-switch'>
+				</div>
+				<small style="padding-left: 1rem; color: var(--text-secondary);">Note: KV has a 25MB file size limit.</small>
 			</div>
 			<div class='setting-group'>
 				<h4>Telegram Proxy</h4>
@@ -4157,6 +4219,7 @@
 		showHeatmap: true, imageUploadDestination: 'local', imgurClientId: '',
 		surfaceColor: '#ffffff', surfaceColorDark: '#151f31', surfaceOpacity: 1,
 		backgroundOpacity: 1, backgroundImage: '/bg.jpg', backgroundBlur: 0,
+		attachmentStorage: 'r2', imageUploadStorage: 'r2',
 		waterfallCardWidth: 320, enableDateGrouping: false, telegramProxy: false,
 		showFavorites: true,  // 控制收藏夹
 		showArchive: true,      // 控制归档
@@ -4178,6 +4241,21 @@
 		}
 	}
 	loadSettings();
+	async function loadSessionInfo() {
+		try {
+			const response = await fetch('/api/session');
+			if (response.ok) {
+				const session = await response.json();
+				const userInfoContainer = document.getElementById('user-info-container');
+				userInfoContainer.innerHTML = `
+                    <span class="username">${session.username}</span>
+                    <button id="logout-btn-header" class="btn logout-btn-header">Logout</button>
+                `;
+				userInfoContainer.style.display = 'flex';
+				document.getElementById('logout-btn-header').addEventListener('click', () => logoutBtn.click());
+			}
+		} catch (error) { console.error('Could not fetch session info:', error); }
+	}
 
 	async function saveSettings() {
 		try {
@@ -5616,6 +5694,7 @@
 		document.getElementById('toggle-feature-pinning').checked = settings.enablePinning;
 		document.getElementById('toggle-feature-sharing').checked = settings.enableSharing;
 		document.getElementById('toggle-feature-docs').checked = settings.showDocs;
+		document.getElementById('toggle-attachment-storage').checked = settings.attachmentStorage === 'kv';
 	}
 
 	function initializeSettings() {
@@ -5783,6 +5862,10 @@
 		toggleTelegramProxy.addEventListener('change', (e) => {
 			settings.telegramProxy = e.target.checked;
 		});
+		document.getElementById('toggle-attachment-storage').addEventListener('change', (e) => {
+			settings.attachmentStorage = e.target.checked ? 'kv' : 'r2';
+		});
+
 		const settingsBtn = document.getElementById('settings-btn');
 		if (settingsBtn) {
 			settingsBtn.addEventListener('click', () => {
@@ -6915,6 +6998,7 @@
 		// 确保只有在登录成功后才执行这些操作
 		initializeCollapsibleSidebars(); // 初始化侧边栏折叠状态
 		initializeViewMode(); // 初始化宽屏模式
+		loadSessionInfo();
 		updateEditorVisibility();
 		loadAndRenderStats();
 		loadAndRenderTags();
@@ -7894,6 +7978,7 @@
 
 		const formData = new FormData();
 		formData.append('content', noteInput.value);
+		formData.append('visibility', noteForm.dataset.visibility || 'private');
 		Array.from(noteFile.files).forEach(file => {
 			if (!file.type.startsWith('image/')) {
 				formData.append('file', file);
