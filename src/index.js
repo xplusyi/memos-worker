@@ -531,7 +531,8 @@ async function handleNotesList(request, env, session) {
 				const isArchivedMode = url.searchParams.get('archived') === 'true';
 
 				let whereClauses = [];
-				let bindings = [session.username];
+				// 【关键修复】初始化一个空的 bindings 数组
+				let bindings = [];
 				let joinClause = "";
 
 				if (isArchivedMode) {
@@ -546,6 +547,8 @@ async function handleNotesList(request, env, session) {
 				const isAdmin = session.isAdmin === true;
 				if (!isAdmin) {
 					whereClauses.push("(n.visibility = 'workspace' OR n.owner_id = ?)");
+					// 【关键修复】只有在需要占位符时，才将 username 添加到 bindings
+					bindings.push(session.username);
 				}
 
 
