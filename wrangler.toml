@@ -18,6 +18,6 @@ id = "YOUR_KV_NAMESPACE_ID"
 preview_id = ""
 
 [[r2_buckets]]
-binding = "NOTES_R2_BUCKET"
-bucket_name = "YOUR_R2_BUCKET_NAME"
-preview_bucket_name = "notes-files-preview"
+# binding = "NOTES_R2_BUCKET"
+# bucket_name = "YOUR_R2_BUCKET_NAME"
+# preview_bucket_name = "notes-files-preview"
